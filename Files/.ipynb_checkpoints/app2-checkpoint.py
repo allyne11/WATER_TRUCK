@@ -1,37 +1,16 @@
-# 📦 Project layout (single-file demo below; split into files in real project)
-# ├── app.py                # Streamlit UI (CRUD, Map, Service Order)
-# ├── db.py                 # DB init and helpers (SQLite for MVP)
-# ├── models.py             # Pydantic/SQLAlchemy models
-# ├── predict.py            # Simple refill-interval forecasting
-# ├── requirements.txt      # Python deps
-# └── sample_data.csv       # Example customers
+import os, math
+from datetime import datetime, timedelta
+from typing import Optional, List
 
-# ------------------------------
-# requirements.txt
-# ------------------------------
-# streamlit==1.40.0
-# pandas==2.2.2
-# sqlalchemy==2.0.36
-# pydantic==2.9.2
-# folium==0.17.0
-# geopy==2.4.1
-# numpy==1.26.4
-
-# ------------------------------
-# app.py  (single-file version for easy copy/paste)
-# ------------------------------
-import os
-import math
 import pandas as pd
 import numpy as np
 import streamlit as st
-from datetime import datetime, timedelta
-from typing import Optional, List
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 import folium
+from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Water Truck Dispatch", page_icon="🚚", layout="wide")
 
@@ -41,32 +20,26 @@ DB_URL = os.environ.get("WATERTRUCK_DB_URL", "sqlite:///watertruck.db")
 def get_engine() -> Engine:
     engine = create_engine(DB_URL, future=True)
     with engine.begin() as conn:
-        conn.exec_driver_sql(
-            """
-            CREATE TABLE IF NOT EXISTS customers (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              name TEXT NOT NULL,
-              address TEXT NOT NULL,
-              phone TEXT,
-              latitude REAL,
-              longitude REAL,
-              last_filled DATE,
-              avg_interval_days REAL,
-              notes TEXT
-            );
-            """
-        )
-        conn.exec_driver_sql(
-            """
-            CREATE TABLE IF NOT EXISTS fills (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              customer_id INTEGER NOT NULL,
-              filled_at DATE NOT NULL,
-              gallons REAL,
-              FOREIGN KEY(customer_id) REFERENCES customers(id)
-            );
-            """
-        )
+        conn.exec_driver_sql("""
+        CREATE TABLE IF NOT EXISTS customers (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          address TEXT NOT NULL,
+          phone TEXT,
+          latitude REAL,
+          longitude REAL,
+          last_filled DATE,
+          avg_interval_days REAL,
+          notes TEXT
+        );""")
+        conn.exec_driver_sql("""
+        CREATE TABLE IF NOT EXISTS fills (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          customer_id INTEGER NOT NULL,
+          filled_at DATE NOT NULL,
+          gallons REAL,
+          FOREIGN KEY(customer_id) REFERENCES customers(id)
+        );""")
     return engine
 
 engine = get_engine()
@@ -118,16 +91,6 @@ def global_median_interval() -> Optional[float]:
         all_deltas += compute_intervals(cid)
     return float(np.median(all_deltas)) if all_deltas else None
 
-def typical_gallons(cid: int) -> Optional[float]:
-    """Median gallons historically filled for this customer (if recorded)."""
-    fills = fetch_df("SELECT gallons FROM fills WHERE customer_id=:cid AND gallons IS NOT NULL", cid=cid)
-    if fills.empty:
-        return None
-    try:
-        return float(np.nanmedian(pd.to_numeric(fills["gallons"], errors="coerce")))
-    except Exception:
-        return None
-
 def next_due_date_for_customer(row: pd.Series, today: datetime):
     cid = int(row["id"])
     intervals = compute_intervals(cid)
@@ -141,7 +104,7 @@ def next_due_date_for_customer(row: pd.Series, today: datetime):
     risk = 1 / (1 + math.exp(-days_over / max(3.0, interval / 6)))
     return due, float(risk)
 
-st.title("🚚 Water Truck – Customers, Map & Service Order")
+st.title("🚚 Water Truck – Customers, Map & Refill Predictions")
 
 with st.sidebar:
     st.header("Add / Update Customer")
@@ -166,40 +129,30 @@ with st.sidebar:
             record_fill(cid, pd.to_datetime(dt), gallons if gallons > 0 else None)
             st.success("Fill recorded and last date updated.")
 
-_tab1, _tab2, _tab3 = st.tabs(["Customers", "Map", "Service Order"])
+tab1, tab2, tab3 = st.tabs(["Customers", "Map", "Predictions"])
 
-with _tab1:
+with tab1:
     st.subheader("Customers")
     df = fetch_df("SELECT * FROM customers ORDER BY name")
-    if df.empty:
-        st.dataframe(df, use_container_width=True)
-    else:
-        # Hide latitude/longitude in the table view
-        cols = [c for c in df.columns if c not in ("latitude", "longitude")]
-        st.dataframe(df[cols], use_container_width=True)
+    st.dataframe(df, use_container_width=True)
 
-with _tab2:
+with tab2:
     st.subheader("Customer Map")
     df = fetch_df("SELECT id,name,address,latitude,longitude,last_filled FROM customers")
-
     if not df.empty and df["latitude"].notna().any():
         center_lat = df["latitude"].dropna().mean()
         center_lon = df["longitude"].dropna().mean()
     else:
         center_lat, center_lon = 30.2672, -97.7431
-
     m = folium.Map(location=[center_lat, center_lon], zoom_start=10)
-
     for _, r in df.iterrows():
         if pd.notna(r["latitude"]) and pd.notna(r["longitude"]):
             popup = f"<b>{r['name']}</b><br>{r['address']}<br>Last filled: {r['last_filled']}"
             folium.Marker([r["latitude"], r["longitude"]], popup=popup).add_to(m)
+    st_folium(m, height=520, width=None)
 
-    html = m._repr_html_()
-    st.components.v1.html(html, height=520, scrolling=False)
-
-with _tab3:
-    st.subheader("Service Order – First to Last")
+with tab3:
+    st.subheader("Predicted Next Fills")
     today = datetime.today()
     df = fetch_df("SELECT * FROM customers ORDER BY name")
     if df.empty:
@@ -207,48 +160,6 @@ with _tab3:
     else:
         df["due_date"], df["risk_score"] = zip(*df.apply(lambda r: next_due_date_for_customer(r, today), axis=1))
         df["days_until_due"] = (pd.to_datetime(df["due_date"]) - today).dt.days
-
-        def split_name(full: str):
-            parts = str(full).strip().split()
-            if not parts: return "", ""
-            if len(parts) == 1: return parts[0], ""
-            return parts[0], " ".join(parts[1:])
-
-        first_last = df["name"].apply(split_name)
-        df["first_name"] = first_last.apply(lambda x: x[0])
-        df["last_name"]  = first_last.apply(lambda x: x[1])
-
-        # Sort strictly by soonest due date
-        df_sorted = df.sort_values(["due_date"], ascending=[True])
-
-        # Compute status for coloring: overdue / today / future
-        due_dates = pd.to_datetime(df_sorted["due_date"]).dt.date
-        today_date = today.date()
-        df_sorted["status"] = np.where(
-            due_dates < today_date, "overdue",
-            np.where(due_dates == today_date, "today", "future")
-        )
-
-        # Show only requested columns
-        # Include Gallons Needed (typical median from history if available)
-        df_sorted["gallons_needed"] = df_sorted["id"].apply(typical_gallons)
-
-        cols = ["first_name", "last_name", "address", "gallons_needed"]
-        df_view = df_sorted[cols].reset_index(drop=True)
-        status_series = df_sorted["status"].reset_index(drop=True)
-
-        # Style rows by status
-        def highlight_row(row):
-            stt = status_series.iloc[row.name]
-            color_map = {"future": "tan", "today": "lightgreen", "overdue": "red"}
-            color = color_map.get(stt, "")
-            return [f"background-color: {color}" for _ in row]
-
-        st.dataframe(df_view.style.apply(highlight_row, axis=1), use_container_width=True)
-
-        st.download_button(
-            label="⬇️ Download service order (CSV)",
-            data=df_view.to_csv(index=False),
-            file_name=f"service_order_{today.date()}.csv",
-            mime="text/csv",
-        )
+        df_sorted = df.sort_values(["risk_score", "days_until_due"], ascending=[False, True])
+        st.dataframe(df_sorted[["name","address","phone","last_filled","due_date","days_until_due","risk_score"]],
+                     use_container_width=True)

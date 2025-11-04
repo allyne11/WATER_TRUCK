@@ -1,0 +1,8 @@
+streamlit
+pandas
+sqlalchemy
+pydantic
+folium
+streamlit-folium
+geopy
+numpy
